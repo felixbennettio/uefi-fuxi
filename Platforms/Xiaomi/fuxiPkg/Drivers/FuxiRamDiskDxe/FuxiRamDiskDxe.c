@@ -1,10 +1,19 @@
 /** @file
   Expose the UniXNU payload volume as a block device.
 
-  `fastboot boot` loads the payload FAT volume into RAM, but nothing tells this
-  firmware where. Scan the UEFI memory map for a FAT boot sector labelled
-  FUXIESP and publish it through EFI_BLOCK_IO_PROTOCOL; the standard FAT driver
-  then mounts it and the boot manager sees an ordinary file system.
+  v2: `fastboot boot` loads our boot image; ABL then places the DTB (reserved
+  by SEC at a fixed address, printed as "reserved DT") and the ramdisk inside
+  the 0xA8000000..0xB8000000 window and records both in the DT /chosen node.
+  The original driver trusted a SEC hint HOB that Mu-Silicium never publishes
+  (wrong GUID) and skipped reserved memory when scanning, so the payload was
+  never found. This version, in order:
+
+    1. reads the incoming x0 (DTB) from the Mu-Silicium entry-argument HOB,
+    2. falls back to the DT address observed in the SEC log on this device,
+    3. falls back to scanning the ABL kernel window for an FDT magic,
+    4. publishes /chosen linux,initrd-start..end as the payload volume,
+    5. falls back to the original memory-map scan (non-reserved memory),
+    6. falls back to probing the ABL kernel window for a FAT boot sector.
 
   SPDX-License-Identifier: BSD-2-Clause-Patent
 **/
@@ -12,11 +21,11 @@
 #include <Uefi.h>
 #include <Library/UefiBootServicesTableLib.h>
 #include <Library/UefiLib.h>
+#include <Library/BaseLib.h>
 #include <Library/BaseMemoryLib.h>
 #include <Library/MemoryAllocationLib.h>
 #include <Library/DevicePathLib.h>
 #include <Library/HobLib.h>
-#include <Library/CpuLib.h>
 #include <Protocol/BlockIo.h>
 #include <Protocol/DevicePath.h>
 
@@ -24,13 +33,32 @@
 #define FUXI_LABEL_LENGTH  7
 #define FUXI_BLOCK_SIZE    512
 
-STATIC EFI_BLOCK_IO_MEDIA     mMedia;
+// ABL loads the kernel, the ramdisk and the DTB inside this window; SEC
+// reserves it in its memory map ("Kernel", handed to the next payload).
+#define FUXI_KERNEL_WINDOW_BASE  0xA8000000ULL
+#define FUXI_KERNEL_WINDOW_END   0xB8000000ULL
+
+// DT address SEC printed as "reserved DT 0xB6098000..0xB615FFFF" on this
+// device. Deterministic for this ABL, but only the first guess tried.
+#define FUXI_KNOWN_DT_BASE  0xB6098000ULL
+
+// Mu-Silicium SEC stores the incoming x0 (DTB address) in this HOB as UINT64.
+STATIC CONST EFI_GUID mDtbHobGuid = {
+  0xDAEE82E6, 0x8090, 0x4E72, { 0xBF, 0xB9, 0x78, 0xC1, 0x3C, 0xD4, 0xE3, 0x59 }
+};
+
+#define FDT_MAGIC      0xD00DFEED
+#define FDT_BEGIN_NODE 1
+#define FDT_END_NODE   2
+#define FDT_PROP       3
+#define FDT_NOP        4
+#define FDT_END        9
+
+STATIC EFI_BLOCK_IO_MEDIA  mMedia;
 STATIC EFI_BLOCK_IO_PROTOCOL  mBlockIo;
 STATIC UINT8                  *mVolumeBase;
 STATIC BOOLEAN                mLastLabeled;
-STATIC BOOLEAN                mHintSeen;
-STATIC UINT64                 mHintValue;
-STATIC UINTN                  mVolumeBytes;
+STATIC UINT64                 mVolumeBytes;
 
 STATIC
 BOOLEAN
@@ -95,6 +123,197 @@ IsPayloadVolume (
 }
 
 STATIC
+UINT32
+ReadBe32 (
+  IN CONST VOID  *P
+  )
+{
+  CONST UINT8  *B = (CONST UINT8 *)P;
+
+  return ((UINT32)B[0] << 24) | ((UINT32)B[1] << 16) | ((UINT32)B[2] << 8) | (UINT32)B[3];
+}
+
+STATIC
+UINT64
+ReadBe64 (
+  IN CONST VOID  *P
+  )
+{
+  return ((UINT64)ReadBe32 (P) << 32) | (UINT64)ReadBe32 ((CONST UINT8 *)P + 4);
+}
+
+//
+// Minimal FDT walker: return /chosen linux,initrd-start and -end. Avoids a
+// dependency on any FdtLib the platform DSC may or may not link.
+//
+STATIC
+BOOLEAN
+ReadChosenInitrd (
+  IN  CONST VOID  *Fdt,
+  OUT UINT64      *Start,
+  OUT UINT64      *End
+  )
+{
+  CONST UINT8  *Base       = (CONST UINT8 *)Fdt;
+  UINT32       TotalSize   = ReadBe32 (Base + 4);
+  UINT32       OffStruct   = ReadBe32 (Base + 8);
+  UINT32       OffStrings  = ReadBe32 (Base + 12);
+  CONST UINT8  *P;
+  CONST UINT8  *Limit;
+  UINTN        Depth    = 0;
+  BOOLEAN      InChosen = FALSE;
+  BOOLEAN      HaveStart = FALSE;
+  BOOLEAN      HaveEnd   = FALSE;
+  UINT64       S = 0;
+  UINT64       E = 0;
+
+  if ((ReadBe32 (Base) != FDT_MAGIC) || (TotalSize < 40) || (TotalSize > 0x400000) ||
+      (OffStruct >= TotalSize) || (OffStrings >= TotalSize))
+  {
+    return FALSE;
+  }
+
+  P     = Base + OffStruct;
+  Limit = Base + TotalSize;
+
+  while (P + 4 <= Limit) {
+    UINT32 Token = ReadBe32 (P);
+    P += 4;
+
+    if (Token == FDT_BEGIN_NODE) {
+      UINTN  NameLen = 0;
+
+      while (P[NameLen] != 0) {
+        NameLen++;
+      }
+
+      Depth++;
+      if ((Depth == 2) && (CompareMem (P, "chosen", 7) == 0)) {
+        InChosen = TRUE;
+      }
+
+      P = (CONST UINT8 *)(((UINTN)P + NameLen + 1 + 3) & ~(UINTN)3);
+    } else if (Token == FDT_END_NODE) {
+      if (InChosen) {
+        // All properties of /chosen are behind us.
+        break;
+      }
+
+      if (Depth == 0) {
+        break;
+      }
+
+      Depth--;
+    } else if (Token == FDT_PROP) {
+      UINT32       Len     = ReadBe32 (P);
+      UINT32       NameOff;
+      CONST UINT8  *Val;
+
+      P += 4;
+      NameOff = ReadBe32 (P);
+      P += 4;
+      Val = P;
+      P += (Len + 3) & ~3;
+
+      if (InChosen && ((Len == 4) || (Len == 8) || (Len == 16))) {
+        CONST CHAR8  *PropName = (CONST CHAR8 *)(Base + OffStrings + NameOff);
+        UINT64       Val64;
+
+        if (Len == 4) {
+          Val64 = ReadBe32 (Val);
+        } else {
+          Val64 = ReadBe64 (Val);
+        }
+
+        if (CompareMem (PropName, "linux,initrd-start", 19) == 0) {
+          S        = Val64;
+          HaveStart = TRUE;
+        } else if (CompareMem (PropName, "linux,initrd-end", 17) == 0) {
+          E        = Val64;
+          HaveEnd = TRUE;
+        }
+      }
+    } else if ((Token == FDT_NOP) || (Token == FDT_END)) {
+      if (Token == FDT_END) {
+        break;
+      }
+    } else {
+      // Unknown token: the structure block is not something we understand.
+      break;
+    }
+  }
+
+  if (!HaveStart || !HaveEnd || (E <= S)) {
+    return FALSE;
+  }
+
+  *Start = S;
+  *End   = E;
+  return TRUE;
+}
+
+//
+// Locate the ABL device tree: entry-argument HOB, then the address from the
+// SEC log, then a magic scan of the ABL kernel window.
+//
+STATIC
+UINT64
+FindDeviceTree (
+  VOID
+  )
+{
+  EFI_HOB_GUID_TYPE  *Hob;
+  UINT64             Addr;
+
+  Hob = GetFirstGuidHob (&mDtbHobGuid);
+  if ((Hob != NULL) && (GET_GUID_HOB_DATA_SIZE (Hob) >= sizeof (UINT64))) {
+    UINT64 Cand = ReadUnaligned64 ((CONST UINT64 *)GET_GUID_HOB_DATA (Hob));
+
+    if ((Cand >= 0x80000000ULL) && (Cand < 0x100000000ULL) &&
+        (ReadBe32 ((VOID *)(UINTN)Cand) == FDT_MAGIC))
+    {
+      Print (L"FUXIRAMDISK: dtb from entry-arg hob at %lx\n", Cand);
+      return Cand;
+    }
+  }
+
+  if (ReadBe32 ((VOID *)(UINTN)FUXI_KNOWN_DT_BASE) == FDT_MAGIC) {
+    Print (L"FUXIRAMDISK: dtb at the known address %lx\n", (UINT64)FUXI_KNOWN_DT_BASE);
+    return FUXI_KNOWN_DT_BASE;
+  }
+
+  for (Addr = FUXI_KERNEL_WINDOW_BASE; Addr + 0x1000 <= FUXI_KERNEL_WINDOW_END; Addr += 4) {
+    if (ReadBe32 ((VOID *)(UINTN)Addr) == FDT_MAGIC) {
+      Print (L"FUXIRAMDISK: dtb found by window scan at %lx\n", Addr);
+      return Addr;
+    }
+  }
+
+  return 0;
+}
+
+STATIC
+BOOLEAN
+ScanWindowForPayload (
+  VOID
+  )
+{
+  UINT64  Addr;
+  UINT64  Total;
+
+  for (Addr = FUXI_KERNEL_WINDOW_BASE; Addr + FUXI_BLOCK_SIZE <= FUXI_KERNEL_WINDOW_END; Addr += FUXI_BLOCK_SIZE) {
+    if (IsPayloadVolume ((UINT8 *)(UINTN)Addr, &Total)) {
+      mVolumeBase  = (UINT8 *)(UINTN)Addr;
+      mVolumeBytes = Total * FUXI_BLOCK_SIZE;
+      Print (L"FUXIRAMDISK: fat volume in kernel window at %lx\n", Addr);
+      return TRUE;
+    }
+  }
+
+  return FALSE;
+}
+
+STATIC
 EFI_STATUS
 EFIAPI
 FuxiBlockReset (
@@ -150,8 +369,7 @@ FuxiBlockWrite (
   IN EFI_LBA                Lba,
   IN UINTN                  BufferSize,
   IN VOID                   *Buffer
-  )
-{
+  ){
   return EFI_WRITE_PROTECTED;
 }
 
@@ -225,7 +443,7 @@ LocatePayload (
       }
 
       mVolumeBase  = Page;
-      mVolumeBytes = (UINTN)(TotalSectors * FUXI_BLOCK_SIZE);
+      mVolumeBytes = TotalSectors * FUXI_BLOCK_SIZE;
       FreePool (Map);
       return TRUE;
     }
@@ -235,79 +453,19 @@ LocatePayload (
   return FALSE;
 }
 
+//
+// Publish mVolumeBase/mVolumeBytes (already set) as a read-only block device.
+//
+STATIC
 EFI_STATUS
-EFIAPI
-FuxiRamDiskEntry (
-  IN EFI_HANDLE        ImageHandle,
-  IN EFI_SYSTEM_TABLE  *SystemTable
+InstallVolume (
+  VOID
   )
 {
   EFI_STATUS                Status;
-
-  // Make the run visible: the boot manager clears the screen afterwards.
-  gBS->Stall (3000000);
-  Print (L"FUXIRAMDISK: driver entry\n");
   EFI_HANDLE                Handle;
   EFI_DEVICE_PATH_PROTOCOL  *Path;
   VENDOR_DEVICE_PATH        Vendor;
-
-  // SEC publishes the payload address it derived from the device tree; that is
-  // exact, so prefer it over scanning memory.
-  {
-    EFI_PEI_HOB_POINTERS  Hob;
-    STATIC CONST EFI_GUID PayloadGuid = { 0x8f2c1e44, 0x9d3a, 0x4c77, { 0xb1, 0x2e, 0x77, 0x5a, 0x10, 0x4c, 0x9e, 0x31 } };
-
-    Hob.Raw = GetHobList ();
-    while (!END_OF_HOB_LIST (Hob)) {
-      if ((Hob.Header->HobType == EFI_HOB_TYPE_GUID_EXTENSION) &&
-          (CompareGuid (&Hob.Guid->Name, &PayloadGuid))) {
-        UINT64  Base = *(UINT64 *)(Hob.Guid + 1);
-
-        UINT64  Probe;
-        UINT64  Total;
-
-        mHintSeen = TRUE;
-        mHintValue = Base;
-        Print (L"FUXIRAMDISK: device tree at %lx, looking below it\n", Base);
-        for (Probe = Base; (Probe > Base - 0x10000000ULL) && (Probe >= FUXI_BLOCK_SIZE); Probe -= FUXI_BLOCK_SIZE) {
-          if (IsPayloadVolume ((UINT8 *)(UINTN)Probe, &Total)) {
-            Print (L"FUXIRAMDISK: payload at %lx below the tree\n", Probe);
-            mVolumeBase  = (UINT8 *)(UINTN)Probe;
-            mVolumeBytes = (UINTN)(Total * FUXI_BLOCK_SIZE);
-            break;
-          }
-        }
-      }
-
-      Hob.Raw = GET_NEXT_HOB (Hob);
-    }
-  }
-
-  if ((mVolumeBase == NULL) && mHintSeen && (mHintValue >= 0x40000000ULL)) {
-    // The payload sits in the same buffer the bootloader filled, just before the
-    // hint SEC derived from it. 128 MiB of 512-byte steps is a second of work
-    // and never leaves the mapped image.
-    UINT64  Probe;
-    UINT64  Total;
-
-    for (Probe = mHintValue & ~(UINT64)(FUXI_BLOCK_SIZE - 1);
-         Probe > mHintValue - 0x08000000ULL;
-         Probe -= FUXI_BLOCK_SIZE) {
-      if (IsPayloadVolume ((UINT8 *)(UINTN)Probe, &Total)) {
-        mVolumeBase  = (UINT8 *)(UINTN)Probe;
-        mVolumeBytes = (UINTN)(Total * FUXI_BLOCK_SIZE);
-        Print (L"FUXIRAMDISK: payload found at %lx below the hint\n", Probe);
-        break;
-      }
-    }
-  }
-
-  if (mVolumeBase == NULL) {
-    Print (L"SIGNAL: no volume from the hint\n");
-    Print (L"  hob=%d base=%lx\n", mHintSeen ? 1 : 0, mHintValue);
-    gBS->Stall (3000000);
-    return EFI_SUCCESS;
-  }
 
   ZeroMem (&Vendor, sizeof (Vendor));
   Vendor.Header.Type    = HARDWARE_DEVICE_PATH;
@@ -351,13 +509,73 @@ FuxiRamDiskEntry (
     return Status;
   }
 
-  Print (L"SIGNAL: summary\n");
-  Print (L"  hob=%d base=%lx\n", mHintSeen ? 1 : 0, mHintValue);
-  Print (L"  volume=%lx\n", (UINT64)(UINTN)mVolumeBase);
-  gBS->Stall (3000000);
-
   Print (L"FUXIRAMDISK: payload at %lx, %lu KiB as a read-only block device\n",
-         (UINT64)(UINTN)mVolumeBase, (UINT64)(mVolumeBytes / 1024));
+         (UINT64)(UINTN)mVolumeBase, mVolumeBytes / 1024);
+  return EFI_SUCCESS;
+}
 
+EFI_STATUS
+EFIAPI
+FuxiRamDiskEntry (
+  IN EFI_HANDLE        ImageHandle,
+  IN EFI_SYSTEM_TABLE  *SystemTable
+  )
+{
+  UINT64  Dtb;
+  UINT64  Start;
+  UINT64  End;
+  UINT64  TotalSectors;
+
+  gBS->Stall (1500000);
+  Print (L"FUXIRAMDISK: driver entry v2\n");
+
+  Dtb = FindDeviceTree ();
+  if (Dtb != 0) {
+    if (ReadChosenInitrd ((VOID *)(UINTN)Dtb, &Start, &End)) {
+      Print (L"FUXIRAMDISK: /chosen initrd %lx-%lx\n", Start, End);
+
+      if ((Start >= 0x80000000ULL) && (End <= 0x100000000ULL) &&
+          (End - Start >= 0x100000ULL) && ((End - Start) <= 0x20000000ULL) &&
+          IsPayloadVolume ((UINT8 *)(UINTN)Start, &TotalSectors))
+      {
+        mVolumeBase  = (UINT8 *)(UINTN)Start;
+        mVolumeBytes = End - Start;
+        if (mVolumeBytes % FUXI_BLOCK_SIZE != 0) {
+          mVolumeBytes = ((mVolumeBytes + FUXI_BLOCK_SIZE - 1) / FUXI_BLOCK_SIZE) * FUXI_BLOCK_SIZE;
+        }
+
+        if (!EFI_ERROR (InstallVolume ())) {
+          gBS->Stall (2000000);
+          return EFI_SUCCESS;
+        }
+      } else {
+        Print (L"FUXIRAMDISK: /chosen initrd rejected\n");
+      }
+    } else {
+      Print (L"FUXIRAMDISK: no initrd in /chosen\n");
+    }
+  } else {
+    Print (L"FUXIRAMDISK: no device tree found\n");
+  }
+
+  // Memory-map scan: only non-reserved memory, so it cannot see the ABL
+  // window, but keep it as a fallback for other load styles.
+  if (LocatePayload ()) {
+    if (!EFI_ERROR (InstallVolume ())) {
+      gBS->Stall (2000000);
+      return EFI_SUCCESS;
+    }
+  }
+
+  // Direct probe of the reserved ABL kernel window.
+  if (ScanWindowForPayload ()) {
+    if (!EFI_ERROR (InstallVolume ())) {
+      gBS->Stall (2000000);
+      return EFI_SUCCESS;
+    }
+  }
+
+  Print (L"FUXIRAMDISK: no payload found\n");
+  gBS->Stall (2000000);
   return EFI_SUCCESS;
 }
